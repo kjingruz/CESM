@@ -4,7 +4,7 @@ import numpy as np
 import json
 import cv2
 from collections import defaultdict
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import train_test_split
 
 def clean_filenames(directory):
     for filename in os.listdir(directory):
@@ -12,6 +12,29 @@ def clean_filenames(directory):
             new_filename = filename.replace(' .jpg', '.jpg')
             os.rename(os.path.join(directory, filename), os.path.join(directory, new_filename))
             print(f"Renamed: {filename} to {new_filename}")
+
+def is_valid_annotation(annotation, image_name):
+    region_attributes = json.loads(annotation['region_shape_attributes'])
+    shape_type = region_attributes.get('name')
+
+    if shape_type in ['polygon', 'polyline']:
+        if 'all_points_x' in region_attributes and 'all_points_y' in region_attributes:
+            x = region_attributes['all_points_x']
+            y = region_attributes['all_points_y']
+            if len(x) >= 3 and len(y) >= 3:
+                return True
+    elif shape_type == 'ellipse':
+        if all(key in region_attributes for key in ['cx', 'cy', 'rx', 'ry']):
+            return True
+    elif shape_type == 'circle':
+        if all(key in region_attributes for key in ['cx', 'cy', 'r']):
+            return True
+    elif shape_type == 'point':
+        if all(key in region_attributes for key in ['cx', 'cy']):
+            return True
+
+    print(f"Invalid or unrecognized annotation for image {image_name}: {shape_type}")
+    return False
 
 def load_and_process_data(csv_file, excel_file):
     # Load CSV file (for bbox and segmentation)
@@ -44,9 +67,13 @@ def load_and_process_data(csv_file, excel_file):
     # Add annotation information where available
     for idx, row in final_df.iterrows():
         if row['has_annotation']:
-            final_df.at[idx, 'annotations'] = csv_dict[row['Image_name']]
+            valid_annotations = [ann for ann in csv_dict[row['Image_name']] if is_valid_annotation(ann, row['Image_name'])]
+            final_df.at[idx, 'annotations'] = valid_annotations
         else:
             final_df.at[idx, 'annotations'] = []
+
+    # Add a check for usable annotations
+    final_df['has_usable_annotation'] = final_df['annotations'].apply(lambda x: len(x) > 0)
 
     print("\nFinal dataframe shape:", final_df.shape)
     print("Classification counts in final dataframe:")
@@ -54,35 +81,34 @@ def load_and_process_data(csv_file, excel_file):
     print("\nNumerical category counts:")
     print(final_df['category_id'].value_counts().sort_index())
     print("\nImages with annotations:", final_df['has_annotation'].sum())
+    print("Images with usable annotations:", final_df['has_usable_annotation'].sum())
     print("Images without annotations:", (~final_df['has_annotation']).sum())
+    print("Images with annotations but no usable ones:", (final_df['has_annotation'] & ~final_df['has_usable_annotation']).sum())
 
     return final_df
 
-
-
-def split_dataset(df, test_size=0.2, random_state=42):
-    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
-    train_idx, test_idx = next(gss.split(df, groups=df['Patient_ID']))
+def split_dataset(df):
+    # Separate normal images
+    normal_df = df[df['category_id'] == 2]
     
-    train_df = df.iloc[train_idx]
-    test_df = df.iloc[test_idx]
+    # Get benign and malignant images with usable annotations
+    bm_df = df[(df['category_id'].isin([0, 1])) & (df['has_usable_annotation'] == True)]
     
-    train_gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=random_state)
-    train_idx, val_idx = next(train_gss.split(train_df, groups=train_df['Patient_ID']))
+    # Split benign and malignant into train (70%) and test (30%)
+    train_df, test_df = train_test_split(bm_df, test_size=0.3, stratify=bm_df['category_id'], random_state=42)
     
-    final_train_df = train_df.iloc[train_idx]
-    val_df = train_df.iloc[val_idx]
+    # Add normal images to test set
+    test_df = pd.concat([test_df, normal_df])
     
     print("\nClassification counts after splitting:")
-    for split_name, split_df in [('Train', final_train_df), ('Validation', val_df), ('Test', test_df)]:
+    for split_name, split_df in [('Train', train_df), ('Test', test_df)]:
         print(f"{split_name} set:")
         print(split_df['category_id'].value_counts().sort_index())
         print(f"Total images: {len(split_df)}")
+        print(f"Images with usable annotations: {split_df['has_usable_annotation'].sum()}")
         print()
 
-    return final_train_df, val_df, test_df
-
-
+    return train_df, test_df
 
 def create_coco_annotations(df, image_dir):
     images = []
@@ -91,8 +117,8 @@ def create_coco_annotations(df, image_dir):
     
     annotation_id = 1
     image_id = 0
-    category_counts = {0: 0, 1: 0, 2: 0}  # To keep track of image counts per category
-    annotation_counts = {0: 0, 1: 0, 2: 0}  # To keep track of annotation counts per category
+    category_counts = {0: 0, 1: 0, 2: 0}
+    annotation_counts = {0: 0, 1: 0, 2: 0}
 
     for _, row in df.iterrows():
         image_filename = row['Image_name'] + '.jpg'
@@ -113,20 +139,42 @@ def create_coco_annotations(df, image_dir):
         category_id = int(row['category_id'])
         category_counts[category_id] += 1
 
-        if row['has_annotation']:
+        if row['has_usable_annotation'] and category_id != 2:
             for ann in row['annotations']:
                 region_attributes = json.loads(ann['region_shape_attributes'])
-                if 'all_points_x' in region_attributes and 'all_points_y' in region_attributes:
+                shape_type = region_attributes.get('name')
+
+                if shape_type in ['polygon', 'polyline']:
                     x = region_attributes['all_points_x']
                     y = region_attributes['all_points_y']
                     bbox = [float(min(x)), float(min(y)), float(max(x) - min(x)), float(max(y) - min(y))]
                     segmentation = [list(map(float, np.array([x, y]).T.flatten()))]
                     area = float(cv2.contourArea(np.array(list(zip(x, y)), dtype=np.int32)))
+                elif shape_type in ['ellipse', 'circle']:
+                    cx, cy = region_attributes['cx'], region_attributes['cy']
+                    if shape_type == 'ellipse':
+                        rx, ry = region_attributes['rx'], region_attributes['ry']
+                    else:  # circle
+                        rx = ry = region_attributes['r']
+                    bbox = [float(cx - rx), float(cy - ry), float(2 * rx), float(2 * ry)]
+                    # Approximating ellipse/circle with a polygon for segmentation
+                    num_points = 20
+                    theta = np.linspace(0, 2*np.pi, num_points)
+                    x = cx + rx * np.cos(theta)
+                    y = cy + ry * np.sin(theta)
+                    segmentation = [list(map(float, np.array([x, y]).T.flatten()))]
+                    area = float(np.pi * rx * ry)
+                elif shape_type == 'point':
+                    cx, cy = region_attributes['cx'], region_attributes['cy']
+                    # For a point, we'll create a small box around it
+                    box_size = 5  # You can adjust this value
+                    bbox = [float(cx - box_size/2), float(cy - box_size/2), float(box_size), float(box_size)]
+                    segmentation = [[cx, cy]]  # A point is represented as a single-point polygon
+                    area = 1  # Area of a point is essentially 1 pixel
                 else:
-                    bbox = [0, 0, float(width), float(height)]
-                    segmentation = [[0, 0, width, 0, width, height, 0, height]]
-                    area = float(width * height)
-                
+                    print(f"Skipping unrecognized shape type for image {row['Image_name']}: {shape_type}")
+                    continue  # Skip unrecognized shapes
+
                 annotations.append({
                     "id": int(annotation_id),
                     "image_id": image_id,
@@ -138,19 +186,6 @@ def create_coco_annotations(df, image_dir):
                 })
                 annotation_id += 1
                 annotation_counts[category_id] += 1
-        else:
-            # For images without annotations (e.g., normal images), use full image
-            annotations.append({
-                "id": int(annotation_id),
-                "image_id": image_id,
-                "category_id": category_id,
-                "bbox": [0, 0, float(width), float(height)],
-                "area": float(width * height),
-                "iscrowd": 0,
-                "segmentation": [[0, 0, width, 0, width, height, 0, height]]
-            })
-            annotation_id += 1
-            annotation_counts[category_id] += 1
         
         image_id += 1
     
@@ -168,23 +203,13 @@ def create_coco_annotations(df, image_dir):
 
 def save_coco_json(annotations, file_path):
     with open(file_path, 'w') as f:
-        json.dump(annotations, f, cls=NumpyEncoder)
-
-class NumpyEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super(NumpyEncoder, self).default(obj)
+        json.dump(annotations, f)
 
 def main():
     csv_file = '../data/Radiology_hand_drawn_segmentations_v2.csv'
     excel_file = '../data/Radiology-manual-annotations.xlsx'
     image_dir = '../data/images'
-    output_dir = '../output'
+    output_dir = './output'
 
     # Clean filenames in the image directory
     clean_filenames(image_dir)
@@ -195,10 +220,10 @@ def main():
     df = load_and_process_data(csv_file, excel_file)
 
     # Split dataset
-    train_df, val_df, test_df = split_dataset(df)
+    train_df, test_df = split_dataset(df)
 
     # Create and save COCO annotations for each split
-    for split_name, split_df in [('train', train_df), ('val', val_df), ('test', test_df)]:
+    for split_name, split_df in [('train', train_df), ('test', test_df)]:
         coco_annotations = create_coco_annotations(split_df, image_dir)
         json_path = os.path.join(output_dir, f'{split_name}_annotations.json')
         save_coco_json(coco_annotations, json_path)
