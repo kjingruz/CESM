@@ -1,19 +1,19 @@
 import os
 import torch
 import torch.nn as nn
-import pandas as pd
-import numpy as np
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
+import pandas as pd
 from PIL import Image
+import numpy as np
 from sklearn.metrics import confusion_matrix
 import timm
+import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import torch.optim as optim
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+import seaborn as sns
 
-# Define the CustomDataset class for standard transforms
+# Define the CustomDataset class
 class CustomDataset(Dataset):
     def __init__(self, csv_file, img_dir, transform=None):
         self.data = pd.read_csv(csv_file)
@@ -30,30 +30,6 @@ class CustomDataset(Dataset):
 
         if self.transform:
             image = self.transform(image)
-
-        return image, label
-
-# Define the CustomDataset class for Albumentations transforms
-class CustomDatasetAlbumentations(Dataset):
-    def __init__(self, csv_file, img_dir, transform=None):
-        self.data = pd.read_csv(csv_file)
-        self.img_dir = img_dir
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        img_name = os.path.join(self.img_dir, str(self.data.iloc[idx, 0]) + '.jpg')
-        image = Image.open(img_name).convert('RGB')
-        label = int(self.data.iloc[idx, 1])
-
-        if self.transform:
-            image = np.array(image)
-            augmented = self.transform(image=image)
-            image = augmented['image']
-        else:
-            image = transforms.ToTensor()(image)
 
         return image, label
 
@@ -76,17 +52,7 @@ def get_transform(train):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-# Albumentations transform for Model 1 (ResNet50 with Albumentations)
-def get_train_transform_model1():
-    return A.Compose([
-        A.RandomResizedCrop(height=224, width=224),
-        A.HorizontalFlip(p=0.5),
-        A.RandomBrightnessContrast(p=0.2),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-# Define the compute_sens_spec function
+# Define compute_sens_spec function
 def compute_sens_spec(y_true, y_pred, pos_label):
     y_true_binary = np.array([1 if y == pos_label else 0 for y in y_true])
     y_pred_binary = np.array([1 if y == pos_label else 0 for y in y_pred])
@@ -128,6 +94,7 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler, num_epochs=
 
                     if phase == 'train':
                         loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
 
                 running_loss += loss.item() * inputs.size(0)
@@ -158,6 +125,18 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler, num_epochs=
     # Load best model weights
     model.load_state_dict(best_model_wts)
     return model
+
+# Mixup functions (if needed)
+def mixup_data(x, y, alpha=0.2):
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 # Training function for models using Mixup
 def train_model_mixup(model, dataloaders, criterion, optimizer, scheduler, num_epochs=100, device='cuda', patience=20):
@@ -197,6 +176,7 @@ def train_model_mixup(model, dataloaders, criterion, optimizer, scheduler, num_e
 
                 if phase == 'train':
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
 
                 running_loss += loss.item() * inputs.size(0)
@@ -230,19 +210,6 @@ def train_model_mixup(model, dataloaders, criterion, optimizer, scheduler, num_e
     # Load best model weights
     model.load_state_dict(best_model_wts)
     return model
-
-# Mixup functions
-def mixup_data(x, y, alpha=1.0):
-    '''Returns mixed inputs, pairs of targets, and lambda'''
-    lam = np.random.beta(alpha, alpha)
-    batch_size = x.size()[0]
-    index = torch.randperm(batch_size).to(x.device)
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 # Helper function to get model by class name and dropout settings
 def get_model_by_name(model_class_name, use_dropout=False, dropout_rates=None):
@@ -372,6 +339,18 @@ class ViTModel(nn.Module):
     def forward(self, x):
         return self.vit(x)
 
+# Function to plot and save confusion matrix
+def plot_confusion_matrix(cm, classes, model_name, save_dir):
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=classes, yticklabels=classes)
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.title(f'Confusion Matrix for {model_name}')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'confusion_matrix_{model_name.replace(" ", "_")}.png'))
+    plt.close()
+
 # Main function
 def main():
     # Update these paths according to your directory structure
@@ -382,6 +361,11 @@ def main():
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    # Create a folder to save confusion matrices
+    save_dir = 'confusion_matrices'
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
     # List to hold all model evaluations
     all_models_data = []
 
@@ -390,6 +374,170 @@ def main():
 
     # List of models to train and evaluate
     models_info = [
+        # Models trained at both 100 and 200 epochs
+        # ResNet50 without dropout
+        {
+            'Model Name': 'ResNet50 without Dropout (100 epochs)',
+            'Model Definition': 'ResNet50',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomResNet',
+            'Save Path': 'resnet50_no_dropout_100epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': False,
+            'Dropout Rate': None,
+            'Num Epochs': 100
+        },
+        {
+            'Model Name': 'ResNet50 without Dropout (200 epochs)',
+            'Model Definition': 'ResNet50',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomResNet',
+            'Save Path': 'resnet50_no_dropout_200epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': False,
+            'Dropout Rate': None,
+            'Num Epochs': 200
+        },
+        # ResNet50 with dropout (0.3)
+        {
+            'Model Name': 'ResNet50 with Dropout 0.3 (100 epochs)',
+            'Model Definition': 'ResNet50',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomResNet',
+            'Save Path': 'resnet50_dropout0.3_100epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': True,
+            'Dropout Rate': [0.3],
+            'Num Epochs': 100
+        },
+        {
+            'Model Name': 'ResNet50 with Dropout 0.3 (200 epochs)',
+            'Model Definition': 'ResNet50',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomResNet',
+            'Save Path': 'resnet50_dropout0.3_200epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': True,
+            'Dropout Rate': [0.3],
+            'Num Epochs': 200
+        },
+        # ResNet50 with dropout (0.3 and 0.5)
+        {
+            'Model Name': 'ResNet50 with Dropout 0.3 and 0.5 (100 epochs)',
+            'Model Definition': 'ResNet50',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomResNet',
+            'Save Path': 'resnet50_dropout0.3_0.5_100epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': True,
+            'Dropout Rate': [0.3, 0.5],
+            'Num Epochs': 100
+        },
+        {
+            'Model Name': 'ResNet50 with Dropout 0.3 and 0.5 (200 epochs)',
+            'Model Definition': 'ResNet50',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomResNet',
+            'Save Path': 'resnet50_dropout0.3_0.5_200epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': True,
+            'Dropout Rate': [0.3, 0.5],
+            'Num Epochs': 200
+        },
+        # ViT with dropout (0.5)
+        {
+            'Model Name': 'ViT with Dropout 0.5 (100 epochs)',
+            'Model Definition': 'ViT Base Patch16 224',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'ViTModel',
+            'Save Path': 'vit_dropout0.5_100epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': True,
+            'Dropout Rate': 0.5,
+            'Num Epochs': 100
+        },
+        {
+            'Model Name': 'ViT with Dropout 0.5 (200 epochs)',
+            'Model Definition': 'ViT Base Patch16 224',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'ViTModel',
+            'Save Path': 'vit_dropout0.5_200epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': False,
+            'Use Dropout': True,
+            'Dropout Rate': 0.5,
+            'Num Epochs': 200
+        },
+        # EfficientNet-B4 without dropout
+        {
+            'Model Name': 'EfficientNet-B4 without Dropout (100 epochs)',
+            'Model Definition': 'EfficientNet-B4',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomEfficientNet_B4',
+            'Save Path': 'efficientnet_b4_no_dropout_100epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': True,
+            'Use Dropout': False,
+            'Dropout Rate': None,
+            'Num Epochs': 100
+        },
+        {
+            'Model Name': 'EfficientNet-B4 without Dropout (200 epochs)',
+            'Model Definition': 'EfficientNet-B4',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomEfficientNet_B4',
+            'Save Path': 'efficientnet_b4_no_dropout_200epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': True,
+            'Use Dropout': False,
+            'Dropout Rate': None,
+            'Num Epochs': 200
+        },
+        # EfficientNet-B4 with dropout (0.3)
+        {
+            'Model Name': 'EfficientNet-B4 with Dropout 0.3 (100 epochs)',
+            'Model Definition': 'EfficientNet-B4',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomEfficientNet_B4',
+            'Save Path': 'efficientnet_b4_dropout0.3_100epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': True,
+            'Use Dropout': True,
+            'Dropout Rate': 0.3,
+            'Num Epochs': 100
+        },
+        {
+            'Model Name': 'EfficientNet-B4 with Dropout 0.3 (200 epochs)',
+            'Model Definition': 'EfficientNet-B4',
+            'Pretrained Dataset': 'ImageNet',
+            'Augmentation Method': 'Standard Transforms',
+            'Model Class': 'CustomEfficientNet_B4',
+            'Save Path': 'efficientnet_b4_dropout0.3_200epochs.pth',
+            'Use Albumentations': False,
+            'Use Mixup': True,
+            'Use Dropout': True,
+            'Dropout Rate': 0.3,
+            'Num Epochs': 200
+        },
+        # The rest of the models as before
         # DenseNet121 with dropout (0.3)
         {
             'Model Name': 'DenseNet121 with Dropout 0.3',
@@ -401,7 +549,8 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': True,
-            'Dropout Rate': 0.3
+            'Dropout Rate': 0.3,
+            'Num Epochs': 100
         },
         # DenseNet121 without dropout
         {
@@ -414,7 +563,8 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': False,
-            'Dropout Rate': None
+            'Dropout Rate': None,
+            'Num Epochs': 100
         },
         # EfficientNet-B3 with dropout (0.3)
         {
@@ -427,7 +577,8 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': True,
-            'Dropout Rate': 0.3
+            'Dropout Rate': 0.3,
+            'Num Epochs': 100
         },
         # EfficientNet-B3 without dropout
         {
@@ -440,48 +591,10 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': False,
-            'Dropout Rate': None
+            'Dropout Rate': None,
+            'Num Epochs': 100
         },
-        # ResNet50 without dropout
-        {
-            'Model Name': 'ResNet50 without Dropout',
-            'Model Definition': 'ResNet50',
-            'Pretrained Dataset': 'ImageNet',
-            'Augmentation Method': 'Albumentations',
-            'Model Class': 'CustomResNet',
-            'Save Path': 'resnet50_no_dropout.pth',
-            'Use Albumentations': True,
-            'Use Mixup': False,
-            'Use Dropout': False,
-            'Dropout Rate': None
-        },
-        # ResNet50 with dropout (0.3)
-        {
-            'Model Name': 'ResNet50 with Dropout 0.3',
-            'Model Definition': 'ResNet50',
-            'Pretrained Dataset': 'ImageNet',
-            'Augmentation Method': 'Albumentations',
-            'Model Class': 'CustomResNet',
-            'Save Path': 'resnet50_dropout0.3.pth',
-            'Use Albumentations': True,
-            'Use Mixup': False,
-            'Use Dropout': True,
-            'Dropout Rate': [0.3]
-        },
-        # ResNet50 with dropout (0.3 and 0.5)
-        {
-            'Model Name': 'ResNet50 with Dropout 0.3 and 0.5',
-            'Model Definition': 'ResNet50',
-            'Pretrained Dataset': 'ImageNet',
-            'Augmentation Method': 'Albumentations',
-            'Model Class': 'CustomResNet',
-            'Save Path': 'resnet50_dropout0.3_0.5.pth',
-            'Use Albumentations': True,
-            'Use Mixup': False,
-            'Use Dropout': True,
-            'Dropout Rate': [0.3, 0.5]
-        },
-        # Vision Transformer without dropout
+        # ViT without dropout
         {
             'Model Name': 'ViT without Dropout',
             'Model Definition': 'ViT Base Patch16 224',
@@ -492,20 +605,8 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': False,
-            'Dropout Rate': None
-        },
-        # Vision Transformer with dropout (0.5)
-        {
-            'Model Name': 'ViT with Dropout 0.5',
-            'Model Definition': 'ViT Base Patch16 224',
-            'Pretrained Dataset': 'ImageNet',
-            'Augmentation Method': 'Standard Transforms',
-            'Model Class': 'ViTModel',
-            'Save Path': 'vit_dropout0.5.pth',
-            'Use Albumentations': False,
-            'Use Mixup': False,
-            'Use Dropout': True,
-            'Dropout Rate': 0.5
+            'Dropout Rate': None,
+            'Num Epochs': 100
         },
         # EfficientNetV2-S with dropout (0.3)
         {
@@ -518,7 +619,8 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': True,
-            'Dropout Rate': 0.3
+            'Dropout Rate': 0.3,
+            'Num Epochs': 100
         },
         # EfficientNetV2-S without dropout
         {
@@ -531,33 +633,8 @@ def main():
             'Use Albumentations': False,
             'Use Mixup': False,
             'Use Dropout': False,
-            'Dropout Rate': None
-        },
-        # EfficientNet-B4 without dropout
-        {
-            'Model Name': 'EfficientNet-B4 without Dropout',
-            'Model Definition': 'EfficientNet-B4',
-            'Pretrained Dataset': 'ImageNet',
-            'Augmentation Method': 'Standard Transforms',
-            'Model Class': 'CustomEfficientNet_B4',
-            'Save Path': 'efficientnet_b4_no_dropout.pth',
-            'Use Albumentations': False,
-            'Use Mixup': True,  # Assuming Mixup as per previous code
-            'Use Dropout': False,
-            'Dropout Rate': None
-        },
-        # EfficientNet-B4 with dropout (0.3)
-        {
-            'Model Name': 'EfficientNet-B4 with Dropout 0.3',
-            'Model Definition': 'EfficientNet-B4',
-            'Pretrained Dataset': 'ImageNet',
-            'Augmentation Method': 'Standard Transforms',
-            'Model Class': 'CustomEfficientNet_B4',
-            'Save Path': 'efficientnet_b4_dropout0.3.pth',
-            'Use Albumentations': False,
-            'Use Mixup': True,  # Assuming Mixup as per previous code
-            'Use Dropout': True,
-            'Dropout Rate': 0.3
+            'Dropout Rate': None,
+            'Num Epochs': 100
         },
     ]
 
@@ -572,12 +649,8 @@ def main():
         )
 
         # Select the appropriate dataset class and transforms
-        if model_info['Use Albumentations']:
-            train_dataset = CustomDatasetAlbumentations(
-                train_csv, data_dir, get_train_transform_model1())
-        else:
-            train_dataset = CustomDataset(
-                train_csv, data_dir, get_transform(train=True))
+        train_dataset = CustomDataset(
+            train_csv, data_dir, get_transform(train=True))
 
         # Create DataLoaders
         dataloaders = {
@@ -595,15 +668,17 @@ def main():
 
         # Define optimizer and scheduler
         optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
-        scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-6)
+        scheduler = CosineAnnealingLR(optimizer, T_max=model_info['Num Epochs'], eta_min=1e-6)
 
         # Modify training function for models using Mixup
         if model_info.get('Use Mixup', False):
-            model = train_model_mixup(model, dataloaders, criterion, optimizer, scheduler,
-                                      num_epochs=100, device=device, patience=20)
+            # For Mixup, using label smoothing
+            criterion_mixup = nn.CrossEntropyLoss(label_smoothing=0.1)
+            model = train_model_mixup(model, dataloaders, criterion_mixup, optimizer, scheduler,
+                                      num_epochs=model_info['Num Epochs'], device=device, patience=20)
         else:
             model = train_model(model, dataloaders, criterion, optimizer, scheduler,
-                                num_epochs=100, device=device, patience=20)
+                                num_epochs=model_info['Num Epochs'], device=device, patience=20)
 
         # Save the trained model
         torch.save(model.state_dict(), model_info['Save Path'])
@@ -623,6 +698,9 @@ def main():
 
         # Compute confusion matrix
         conf_matrix = confusion_matrix(all_labels, all_preds)
+
+        # Plot and save confusion matrix
+        plot_confusion_matrix(conf_matrix, class_names, model_info['Model Name'], save_dir)
 
         # Compute sensitivity and specificity for each class
         sens_spec = {}
@@ -646,6 +724,9 @@ def main():
             'Specificity (Benign vs Others)': sens_spec['Benign']['Specificity'],
             'Sensitivity (Malignant vs Others)': sens_spec['Malignant']['Sensitivity'],
             'Specificity (Malignant vs Others)': sens_spec['Malignant']['Specificity'],
+            'Dropout Used': model_info['Use Dropout'],
+            'Dropout Rate': model_info['Dropout Rate'],
+            'Number of Epochs': model_info['Num Epochs'],
         }
 
         # Calculate overall accuracy
@@ -659,9 +740,9 @@ def main():
 
     # Create DataFrame and save to CSV and Excel
     df = pd.DataFrame(all_models_data)
-    df.to_csv('models_evaluation_dropout_comparison.csv', index=False)
-    df.to_excel('models_evaluation_dropout_comparison.xlsx', index=False)
-    print("Training and evaluation completed. Results saved to 'models_evaluation_dropout_comparison.csv' and 'models_evaluation_dropout_comparison.xlsx'.")
+    df.to_csv('models_evaluation_dropout_epochs.csv', index=False)
+    df.to_excel('models_evaluation_dropout_epochs.xlsx', index=False)
+    print("Training and evaluation completed. Results saved to 'models_evaluation_dropout_epochs.csv' and 'models_evaluation_dropout_epochs.xlsx'.")
 
 if __name__ == '__main__':
     main()
