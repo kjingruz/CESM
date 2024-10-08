@@ -18,7 +18,7 @@ from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultTrainer, HookBase, DefaultPredictor
 from detectron2.evaluation import COCOEvaluator, inference_on_dataset
-from detectron2.data. import register_coco_instances
+from detectron2.data.datasets import register_coco_instances
 from detectron2.data import (
     DatasetMapper,
     build_detection_test_loader,
@@ -28,6 +28,18 @@ from detectron2.data import (
 )
 from detectron2.utils.visualizer import Visualizer, ColorMode
 import detectron2.data.transforms as T
+import albumentations as A
+from detectron2.solver import WarmupMultiStepL
+
+from detectron2.data.detection_utils import read_image
+from detectron2.structures import BoxMode
+from detectron2.data import detection_utils as utils
+from detectron2.modeling import build_model
+import torch.nn as nn
+import torch.nn.functional as F
+from detectron2.utils.events import EventStorage
+from detectron2.utils.logger import log_every_n_seconds
+from detectron2.utils import comm
 
 # Fix for np.bool deprecation
 if not hasattr(np, 'bool') or not isinstance(np.bool, type):
