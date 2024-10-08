@@ -30,6 +30,7 @@ from detectron2.data import (
 )
 from detectron2.utils.visualizer import Visualizer, ColorMode
 import detectron2.data.transforms as T
+from detectron2.data import detection_utils as utils
 
 # Fix for np.bool deprecation
 if not hasattr(np, 'bool') or not isinstance(np.bool, type):
