@@ -14,6 +14,8 @@ import re
 import random
 from skimage import io
 
+import albumentations as A  # Import Albumentations
+
 from detectron2 import model_zoo
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultTrainer, HookBase, DefaultPredictor
@@ -28,18 +30,6 @@ from detectron2.data import (
 )
 from detectron2.utils.visualizer import Visualizer, ColorMode
 import detectron2.data.transforms as T
-import albumentations as A
-from detectron2.solver import WarmupMultiStepL
-
-from detectron2.data.detection_utils import read_image
-from detectron2.structures import BoxMode
-from detectron2.data import detection_utils as utils
-from detectron2.modeling import build_model
-import torch.nn as nn
-import torch.nn.functional as F
-from detectron2.utils.events import EventStorage
-from detectron2.utils.logger import log_every_n_seconds
-from detectron2.utils import comm
 
 # Fix for np.bool deprecation
 if not hasattr(np, 'bool') or not isinstance(np.bool, type):
@@ -48,6 +38,69 @@ if not hasattr(np, 'bool') or not isinstance(np.bool, type):
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ===========================
+# Custom Dataset Mapper Definition
+# ===========================
+
+class CustomDatasetMapper(DatasetMapper):
+    """
+    A custom mapper that integrates Detectron2's spatial augmentations
+    with Albumentations' image-level augmentations (brightness and contrast).
+    """
+    def __init__(self, cfg, is_train=True):
+        super().__init__(cfg, is_train)
+        if is_train:
+            # Define Detectron2's spatial augmentations
+            self.detectron2_augmentations = [
+                T.RandomFlip(prob=0.5, horizontal=True, vertical=False),
+                T.RandomRotation(angle=[-10, 10], expand=False),
+            ]
+            # Define Albumentations' image-level augmentations
+            self.albumentations_transform = A.Compose([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, brightness_by_max=True, p=0.5),
+            ])
+        else:
+            self.detectron2_augmentations = []
+            self.albumentations_transform = None
+
+    def __call__(self, dataset_dict):
+        # Deep copy to avoid modifying the original dataset_dict
+        dataset_dict = dataset_dict.copy()
+        
+        # Read the image
+        image = read_image(dataset_dict["file_name"], format=self.image_format)
+        
+        # Convert grayscale to RGB by duplicating channels if necessary
+        if len(image.shape) == 2 or image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        
+        # Apply Detectron2's spatial augmentations
+        aug_input = T.AugInput(image)
+        transforms = T.AugmentationList(self.detectron2_augmentations)(aug_input)
+        image = aug_input.image
+        
+        # Apply Albumentations' brightness and contrast adjustments
+        if self.albumentations_transform:
+            augmented = self.albumentations_transform(image=image)
+            image = augmented["image"]
+        
+        # Convert image to float32 and normalize to [0, 1]
+        image = image.astype("float32") / 255.0
+        
+        dataset_dict["image"] = torch.as_tensor(image.transpose(2, 0, 1))
+        
+        # Apply annotations transformations
+        if "annotations" in dataset_dict:
+            annos = [
+                utils.transform_instance_annotations(obj, transforms, image.shape[:2])
+                for obj in dataset_dict.pop("annotations")
+                if obj.get("iscrowd", 0) == 0
+            ]
+            instances = utils.annotations_to_instances(annos, image.shape[:2])
+            dataset_dict["instances"] = utils.filter_empty_instances(instances)
+        
+        return dataset_dict
 
 # ===========================
 # Custom Evaluator Definition
@@ -154,17 +207,7 @@ class Trainer(DefaultTrainer):
     def build_train_loader(cls, cfg):
         return build_detection_train_loader(
             cfg,
-            mapper=DatasetMapper(
-                cfg,
-                is_train=True,
-                augmentations=[
-                    # Add desired augmentations here
-                    T.RandomFlip(prob=0.5, horizontal=True, vertical=False),
-                    T.RandomRotation(angle=[-10, 10], expand=False),
-                    T.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, brightness_by_max=True),
-                ],
-                image_format=cfg.INPUT.FORMAT
-            )
+            mapper=CustomDatasetMapper(cfg, is_train=True)
         )
 
     def build_hooks(self):
@@ -176,12 +219,9 @@ class Trainer(DefaultTrainer):
             data_loader=build_detection_test_loader(
                 self.cfg,
                 self.cfg.DATASETS.TEST[0],
-                mapper=DatasetMapper(
+                mapper=CustomDatasetMapper(
                     self.cfg,
-                    is_train=False,
-                    augmentations=[],  # No augmentations for validation
-                    image_format=self.cfg.INPUT.FORMAT,
-                    use_instance_mask=self.cfg.MODEL.MASK_ON,
+                    is_train=False
                 )
             ),
             trainer=self
@@ -329,7 +369,7 @@ def train_and_evaluate(cfg, dataset_info, config_name):
             'Batch Size': cfg.SOLVER.IMS_PER_BATCH,
             'Max Iterations': cfg.SOLVER.MAX_ITER
         },
-        'Augmentation Method': cfg.INPUT.RANDOM_FLIP,
+        'Augmentation Method': 'Horizontal Flip, Rotation (±10 degrees), Brightness/Contrast Adjustment',
         'Dataset Info': dataset_info,
     }
 
@@ -452,18 +492,42 @@ def main():
             v = Visualizer(image[:, :, ::-1],
                            metadata=test_metadata, 
                            scale=0.5, 
-                           instance_mode=ColorMode.IMAGE_BW   # Remove the colors of unsegmented pixels. This option is only available for segmentation models
+                           instance_mode=ColorMode.IMAGE_BW   # Remove the colors of unsegmented pixels.
                            )
             out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
             ax.imshow(out.get_image()[:, :, ::-1])
             ax.axis('off')
-            ax.set_title(d["file_name"].split('/')[-1])
+            ax.set_title(os.path.basename(d["file_name"]))
 
         plt.tight_layout()
         viz_path = os.path.join(cfg.OUTPUT_DIR, "test_predictions.png")
         plt.savefig(viz_path)
         plt.close()
         logger.info(f"Test predictions visualized and saved to {viz_path}")
+
+# ===========================
+# Utility Function to Read Image
+# ===========================
+
+def read_image(file_name, format):
+    """
+    Read an image from file.
+    Args:
+        file_name (str): path to the image file
+        format (str): format to read the image. "BGR", "RGB"
+    Returns:
+        np.ndarray: the image in HWC format
+    """
+    img = cv2.imread(file_name, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Failed to read image from {file_name}")
+    if format == "RGB":
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return img
+
+# ===========================
+# Main Execution
+# ===========================
 
 if __name__ == "__main__":
     main()
