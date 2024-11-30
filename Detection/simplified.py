@@ -76,8 +76,8 @@ def main():
     # ====================
     # Dataset Registration
     # ====================
-    data_dir = './output'  # Directory containing annotations
-    image_dir = '../data/images'  # Directory containing images
+    data_dir = './coco_annotations'  # Directory containing annotations
+    image_dir = './images/images_for_training'  # Directory containing images
 
     if not os.path.exists(image_dir):
         logger.error(f"Image directory not found: {image_dir}")
