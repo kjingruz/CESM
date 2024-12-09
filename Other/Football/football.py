@@ -71,7 +71,7 @@ cfg.SOLVER.MAX_ITER = 5000    # may adjust depending on dataset size
 cfg.SOLVER.STEPS = []         # no LR step downs by default
 
 cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 128  # default 512, can adjust
-cfg.MODEL.ROI_HEADS.NUM_CLASSES = 4
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = 5
 
 cfg.OUTPUT_DIR = "./output_football"
 os.makedirs(cfg.OUTPUT_DIR, exist_ok=True)
