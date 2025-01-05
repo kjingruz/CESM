@@ -62,6 +62,10 @@ def main():
     setup_logger()
     logger.info("Starting training with a custom backbone & medical augmentations...")
 
+    # Paths
+    data_dir = './coco_annotations'  # Directory containing annotations
+    image_dir = './images'  # Flat directory containing images
+
     # Register your COCO sets (already done in your code)
     register_coco_instances("cesm_train", {}, "path/to/train_annotations.json", "path/to/images")
     register_coco_instances("cesm_val", {},   "path/to/val_annotations.json",   "path/to/images")
