@@ -108,7 +108,7 @@ def setup_cfg():
 
     # ROI HEADS
     cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 128
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 2  # e.g., if you're only detecting (Benign=0, Malignant=1).
+    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 3  # e.g., if you're only detecting (Benign=0, Malignant=1).
     # or 3 if you're truly using Normal=0, but typically 2 is recommended.
 
     cfg.DATALOADER.FILTER_EMPTY_ANNOTATIONS = False
