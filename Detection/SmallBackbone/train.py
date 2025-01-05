@@ -36,6 +36,7 @@ def setup_cfg():
     
     # Switch backbone depth to ResNet-34 (could do 18 as well)
     cfg.MODEL.RESNETS.DEPTH = 34
+    cfg.MODEL.RESNETS.RES2_OUT_CHANNELS = 64
     
     # Freeze early layers to mitigate overfitting
     cfg.MODEL.BACKBONE.FREEZE_AT = 2
